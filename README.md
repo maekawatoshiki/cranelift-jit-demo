@@ -1,3 +1,13 @@
+# This is not an exapmle for cranelift_jit but cranelift_object!
+
+```sh
+cargo r
+clang main.c emit.o
+./a.out
+```
+
+# Original README below
+
 Hello!
 
 This is a simple demo that JIT-compiles a toy language, using Cranelift.
