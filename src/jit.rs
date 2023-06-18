@@ -1,9 +1,9 @@
 use crate::frontend::*;
 use cranelift::prelude::*;
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{DataContext, Linkage, Module};
+use cranelift_module::{Linkage, Module};
+use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 use std::collections::HashMap;
-use std::slice;
+use target_lexicon::Triple;
 
 /// The basic JIT class.
 pub struct JIT {
@@ -16,32 +16,27 @@ pub struct JIT {
     /// context per thread, though this isn't in the simple demo here.
     ctx: codegen::Context,
 
-    /// The data context, which is to data objects what `ctx` is to functions.
-    data_ctx: DataContext,
-
     /// The module, with the jit backend, which manages the JIT'd
     /// functions.
-    module: JITModule,
+    module: ObjectModule,
 }
 
 impl Default for JIT {
     fn default() -> Self {
-        let mut flag_builder = settings::builder();
-        flag_builder.set("use_colocated_libcalls", "false").unwrap();
-        flag_builder.set("is_pic", "false").unwrap();
-        let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
-            panic!("host machine is not supported: {}", msg);
-        });
+        let mut flag_builder = cranelift_codegen::settings::builder();
+        flag_builder.enable("is_pic").unwrap();
+        let isa_builder = cranelift_codegen::isa::lookup(Triple::host()).unwrap();
         let isa = isa_builder
-            .finish(settings::Flags::new(flag_builder))
+            .finish(cranelift_codegen::settings::Flags::new(flag_builder))
             .unwrap();
-        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
 
-        let module = JITModule::new(builder);
+        let builder =
+            ObjectBuilder::new(isa, "builder", cranelift_module::default_libcall_names()).unwrap();
+
+        let module = ObjectModule::new(builder);
         Self {
             builder_context: FunctionBuilderContext::new(),
             ctx: module.make_context(),
-            data_ctx: DataContext::new(),
             module,
         }
     }
@@ -49,7 +44,7 @@ impl Default for JIT {
 
 impl JIT {
     /// Compile a string in the toy language into machine code.
-    pub fn compile(&mut self, input: &str) -> Result<*const u8, String> {
+    pub fn compile(mut self, input: &str) -> Result<ObjectProduct, String> {
         // First, parse the string, producing AST nodes.
         let (name, params, the_return, stmts) =
             parser::function(input).map_err(|e| e.to_string())?;
@@ -83,32 +78,8 @@ impl JIT {
         // Finalize the functions which we just defined, which resolves any
         // outstanding relocations (patching in addresses, now that they're
         // available).
-        self.module.finalize_definitions().unwrap();
 
-        // We can now retrieve a pointer to the machine code.
-        let code = self.module.get_finalized_function(id);
-
-        Ok(code)
-    }
-
-    /// Create a zero-initialized data section.
-    pub fn create_data(&mut self, name: &str, contents: Vec<u8>) -> Result<&[u8], String> {
-        // The steps here are analogous to `compile`, except that data is much
-        // simpler than functions.
-        self.data_ctx.define(contents.into_boxed_slice());
-        let id = self
-            .module
-            .declare_data(name, Linkage::Export, true, false)
-            .map_err(|e| e.to_string())?;
-
-        self.module
-            .define_data(id, &self.data_ctx)
-            .map_err(|e| e.to_string())?;
-        self.data_ctx.clear();
-        self.module.finalize_definitions().unwrap();
-        let buffer = self.module.get_finalized_data(id);
-        // TODO: Can we move the unsafe into cranelift?
-        Ok(unsafe { slice::from_raw_parts(buffer.0, buffer.1) })
+        Ok(self.module.finish())
     }
 
     // Translate from toy-language AST nodes into Cranelift IR.
@@ -187,7 +158,7 @@ struct FunctionTranslator<'a> {
     int: types::Type,
     builder: FunctionBuilder<'a>,
     variables: HashMap<String, Variable>,
-    module: &'a mut JITModule,
+    module: &'a mut ObjectModule,
 }
 
 impl<'a> FunctionTranslator<'a> {
@@ -366,7 +337,7 @@ impl<'a> FunctionTranslator<'a> {
         // TODO: Streamline the API here?
         let callee = self
             .module
-            .declare_function(&name, Linkage::Import, &sig)
+            .declare_function(&name, Linkage::Export, &sig)
             .expect("problem declaring function");
         let local_callee = self.module.declare_func_in_func(callee, self.builder.func);
 
